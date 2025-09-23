@@ -14,6 +14,7 @@ import threading
 import time
 import random
 import tempfile
+import shlex
 
 AZDO_ORG_URL = os.environ.get("AZDO_ORG_URL", "").rstrip("/")
 AZDO_PROJECT = os.environ.get("AZDO_PROJECT", "")
@@ -93,6 +94,12 @@ def parse_bool_env(var_name, default_value):
 # Quiet git console noise by default
 GIT_QUIET = parse_bool_env("GIT_QUIET", True)
 GIT_PARTIAL_CLONE = parse_bool_env("GIT_PARTIAL_CLONE", False)
+DEBUG = parse_bool_env("DEBUG", False)
+GIT_FALLBACK_HTTPS = parse_bool_env("GIT_FALLBACK_HTTPS", True)
+UPDATE_EXISTING = parse_bool_env("UPDATE_EXISTING", True)
+ONLY_UPDATE = parse_bool_env("ONLY_UPDATE", False)
+GIT_FALLBACK_REMOTE_MODE = os.environ.get("GIT_FALLBACK_REMOTE_MODE", "url").strip().lower()
+SKIP_IF_RESULTS_EXIST = parse_bool_env("SKIP_IF_RESULTS_EXIST", True)
 ONLY_VERIFIED = os.environ.get("TRUFFLEHOG_ONLY_VERIFIED", "").lower() in (
     "1",
     "true",
@@ -175,6 +182,11 @@ def azdo_headers():
         "Authorization": f"Basic {token}",
         "Content-Type": "application/json",
     }
+
+
+def git_auth_header_value():
+    # Basic auth header value for git http.extraHeader
+    return f"Basic {base64.b64encode(f':{AZDO_PAT}'.encode()).decode()}"
 
 
 def list_repos():
@@ -275,6 +287,12 @@ def build_ssh_remote_url(repo_name):
     return f"git@ssh.dev.azure.com:v3/{org}/{AZDO_PROJECT}/{repo_name}"
 
 
+def build_https_remote_url(repo_name):
+    org = get_azdo_org_name(AZDO_ORG_URL)
+    # Azure DevOps HTTPS format: https://dev.azure.com/{org}/{project}/_git/{repo}
+    return f"https://dev.azure.com/{org}/{AZDO_PROJECT}/_git/{repo_name}"
+
+
 def run(cmd, cwd=None, stdout_path=None):
     # Stream to file if provided; otherwise inherit stdout
     stdout_f = open(stdout_path, "wb") if stdout_path else None
@@ -321,6 +339,12 @@ def run_with_retry(cmd, cwd=None, stdout_path=None, max_retries=None, context=No
             tf.close()
             effective_out = temp_path
 
+        if DEBUG and context:
+            try:
+                rendered = shlex.join([str(c) for c in cmd])
+            except Exception:
+                rendered = ' '.join([str(c) for c in cmd])
+            log_info(f"exec: {context} → {rendered}")
         rc = run(cmd, cwd=cwd, stdout_path=effective_out)
         if rc == 0:
             if temp_path:
@@ -357,6 +381,15 @@ def run_with_retry(cmd, cwd=None, stdout_path=None, max_retries=None, context=No
         )
         sleep_sec = backoff_ms / 1000.0
         prefix = f"{context}: " if context else ""
+        # If debugging, show a short tail from the temp output on each retry
+        if DEBUG and temp_path:
+            try:
+                with open(temp_path, "rb") as f:
+                    data = f.read()
+                    snippet_retry = data[-240:].decode(errors="ignore").strip()
+                log_warn(f"{prefix}rc={rc}; tail:\n{snippet_retry}")
+            except Exception:
+                pass
         log_warn(f"{prefix}rc={rc}; retrying in {sleep_sec:.2f}s (attempt {attempts}/{max_r})")
         time.sleep(sleep_sec)
 
@@ -371,7 +404,7 @@ def ensure_dirs():
     SBOM_OUT_DIR.mkdir(parents=True, exist_ok=True)
     SECRETS_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-def git_clone_or_fetch(remote_url, target_dir):
+def git_clone_or_fetch(ssh_url, https_url, target_dir):
     if target_dir.exists() and (target_dir / ".git").exists():
         # Ensure remote origin uses expected SSH URL (update stale HTTPS remotes)
         set_remote_cmd = [
@@ -381,11 +414,17 @@ def git_clone_or_fetch(remote_url, target_dir):
             "remote",
             "set-url",
             "origin",
-            remote_url,
+            ssh_url,
         ]
         rc_set = run(set_remote_cmd, stdout_path=(os.devnull if GIT_QUIET else None))
         if rc_set != 0:
             return False, f"git remote set-url failed rc={rc_set}"
+        # Verify the remote was set correctly
+        rc_verify, current_remote = run_capture(
+            ["git", "-C", str(target_dir), "remote", "get-url", "origin"], timeout_s=10
+        )
+        if rc_verify != 0 or current_remote.strip() != ssh_url:
+            log_warn(f"Remote URL mismatch: expected {ssh_url}, got {current_remote.strip()}")
         # Fetch / prune to update
         cmd = [
             "git",
@@ -403,7 +442,42 @@ def git_clone_or_fetch(remote_url, target_dir):
                 stdout_path=(os.devnull if GIT_QUIET else None),
                 context=f"fetch {target_dir.name}",
             )
-        if rc != 0:
+        if rc != 0 and GIT_FALLBACK_HTTPS:
+            if not https_url:
+                log_warn(f"HTTPS fallback not possible for {target_dir.name}: no https URL")
+                return False, f"git fetch failed rc={rc}"
+            if not AZDO_PAT:
+                log_warn(f"HTTPS fallback requested for {target_dir.name} but AZDO_PAT is empty; skipping fallback")
+            else:
+                log_info(f"Falling back to HTTPS fetch for {target_dir.name}")
+            # Try HTTPS fetch with PAT header
+            header = f"AUTHORIZATION: {git_auth_header_value()}"
+            if GIT_FALLBACK_REMOTE_MODE == "swap":
+                # Temporarily switch origin to https
+                run([
+                    "git","-C",str(target_dir),"remote","set-url","origin",https_url
+                ], stdout_path=(os.devnull if GIT_QUIET else None))
+                cmd_https = [
+                    "git","-c",f"http.extraHeader={header}","-C",str(target_dir),
+                    "fetch","--all","--prune",
+                ]
+            else:
+                # Do not touch origin; fetch from URL into origin/* refs via refspec
+                cmd_https = [
+                    "git","-c",f"http.extraHeader={header}","-C",str(target_dir),
+                    "fetch",https_url,"+refs/heads/*:refs/remotes/origin/*","--prune",
+                ]
+            if GIT_QUIET:
+                cmd_https.append("--quiet")
+            with GIT_NET_SEM:
+                rc = run_with_retry(
+                    cmd_https,
+                    stdout_path=(os.devnull if GIT_QUIET else None),
+                    context=f"fetch-https {target_dir.name}",
+                )
+            if rc != 0:
+                return False, f"git fetch failed rc={rc}"
+        elif rc != 0:
             return False, f"git fetch failed rc={rc}"
         # Reset local default branch to remote HEAD for a clean scan of HEAD
         reset_cmd = [
@@ -425,7 +499,7 @@ def git_clone_or_fetch(remote_url, target_dir):
             "--no-tags",
             "--origin",
             "origin",
-            remote_url,
+            ssh_url,
             str(target_dir),
         ]
         if GIT_PARTIAL_CLONE:
@@ -439,7 +513,40 @@ def git_clone_or_fetch(remote_url, target_dir):
                 stdout_path=(os.devnull if GIT_QUIET else None),
                 context=f"clone {target_dir.name}",
             )
-        if rc != 0:
+        if rc != 0 and GIT_FALLBACK_HTTPS:
+            if not https_url:
+                log_warn(f"HTTPS fallback not possible for {target_dir.name}: no https URL")
+                return False, f"git clone failed rc={rc}"
+            if not AZDO_PAT:
+                log_warn(f"HTTPS fallback requested for {target_dir.name} but AZDO_PAT is empty; skipping fallback")
+                return False, f"git clone failed rc={rc}"
+            log_info(f"Falling back to HTTPS clone for {target_dir.name}")
+            # Try HTTPS clone with PAT header
+            header = f"AUTHORIZATION: {git_auth_header_value()}"
+            cmd_https = [
+                "git",
+                "-c",
+                f"http.extraHeader={header}",
+                "clone",
+                "--no-tags",
+                "--origin",
+                "origin",
+                https_url,
+                str(target_dir),
+            ]
+            if GIT_PARTIAL_CLONE:
+                cmd_https.insert(5, "--filter=blob:none")
+            if GIT_QUIET:
+                cmd_https.insert(2, "--quiet")
+            with GIT_CLONE_SEM:
+                rc = run_with_retry(
+                    cmd_https,
+                    stdout_path=(os.devnull if GIT_QUIET else None),
+                    context=f"clone-https {target_dir.name}",
+                )
+            if rc != 0:
+                return False, f"git clone failed rc={rc}"
+        elif rc != 0:
             return False, f"git clone failed rc={rc}"
         return True, "cloned"
 
@@ -482,15 +589,26 @@ def generate_sbom(sbom_tool, repo_dir, out_file):
 
 
 def run_trufflehog(repo_dir, out_file):
-    # Prefer full history scan; JSONL output
-    cmd = ["trufflehog", "git", str(repo_dir), "--json"]
+    # Prefer full history scan; JSONL output; run in repo dir
+    base_cmd = ["trufflehog", "git", ".", "--json"]
     if ONLY_VERIFIED:
-        cmd.append("--only-verified")
-    # Write to file
-    return run(cmd, stdout_path=str(out_file))
+        base_cmd.append("--only-verified")
+    rc = run(base_cmd, cwd=str(repo_dir), stdout_path=str(out_file))
+    if rc == 0:
+        return rc
+    # Retry disabling self-update/network touches
+    retry_cmd = base_cmd + ["--no-update"]
+    rc2 = run(retry_cmd, cwd=str(repo_dir), stdout_path=str(out_file))
+    if rc2 == 0:
+        return rc2
+    # Last fallback: filesystem scan (less complete than git history)
+    fs_cmd = ["trufflehog", "filesystem", ".", "--json"]
+    if ONLY_VERIFIED:
+        fs_cmd.append("--only-verified")
+    return run(fs_cmd, cwd=str(repo_dir), stdout_path=str(out_file))
 
 
-def process_repo(project, repo_name, remote_url, sbom_tool):
+def process_repo(project, repo_name, ssh_url, https_url, sbom_tool):
     result = {
         "repo": repo_name,
         "clone": None,
@@ -508,17 +626,38 @@ def process_repo(project, repo_name, remote_url, sbom_tool):
     if START_STAGGER_MS > 0:
         time.sleep(random.uniform(0, START_STAGGER_MS) / 1000.0)
     # Informative, low-noise status line
+    # If both outputs exist, optionally skip the repo entirely
+    if SKIP_IF_RESULTS_EXIST and sbom_file.exists() and secrets_file.exists():
+        log_skip(f"{repo_name} results already exist → skip")
+        return {
+            "repo": repo_name,
+            "clone": "results-exist-skip",
+            "clone_class": "results-exist-skip",
+            "sbom": f"exists:{sbom_file}",
+            "secrets": f"exists:{secrets_file}",
+            "errors": [],
+        }
     if (repo_dir / ".git").exists():
+        if not UPDATE_EXISTING:
+            log_skip(f"{repo_name} exists → skip update")
+            result["clone"] = "exists-skipped"
+            result["clone_class"] = "exists-skipped"
+            return result
         log_info(f"Updating {repo_name}")
     else:
+        if ONLY_UPDATE:
+            log_skip(f"{repo_name} missing → skip clone (ONLY_UPDATE)")
+            result["clone"] = "missing-skipped"
+            result["clone_class"] = "missing-skipped"
+            return result
         log_info(f"Cloning {repo_name}")
-    ok, status = git_clone_or_fetch(remote_url, repo_dir)
+    ok, status = git_clone_or_fetch(ssh_url, https_url, repo_dir)
     if ok:
         log_ok(f"{repo_name} {status}")
         result["clone_class"] = "ok"
     else:
         # Classify error to improve summary and optionally skip
-        cls, details = classify_repo_access(remote_url)
+        cls, details = classify_repo_access(ssh_url)
         if cls in ("not-found-or-renamed", "no-permission"):
             log_skip(f"{repo_name} {cls}")
             result["clone"] = cls
@@ -533,24 +672,32 @@ def process_repo(project, repo_name, remote_url, sbom_tool):
         return result
 
     # SBOM
-    log_info(f"SBOM {repo_name} with {sbom_tool}")
-    rc = generate_sbom(sbom_tool, repo_dir, sbom_file)
-    result["sbom"] = f"written:{sbom_file}" if rc == 0 else f"failed rc={rc}"
-    if rc != 0:
-        result["errors"].append(f"sbom rc={rc}")
-        log_error(f"SBOM {repo_name} rc={rc}")
+    if sbom_file.exists():
+        result["sbom"] = f"exists:{sbom_file}"
+        log_skip(f"SBOM {repo_name} exists → skip")
     else:
-        log_ok(f"SBOM {repo_name} -> {sbom_file}")
+        log_info(f"SBOM {repo_name} with {sbom_tool}")
+        rc = generate_sbom(sbom_tool, repo_dir, sbom_file)
+        result["sbom"] = f"written:{sbom_file}" if rc == 0 else f"failed rc={rc}"
+        if rc != 0:
+            result["errors"].append(f"sbom rc={rc}")
+            log_error(f"SBOM {repo_name} rc={rc}")
+        else:
+            log_ok(f"SBOM {repo_name} -> {sbom_file}")
 
     # Secrets
-    log_info(f"TruffleHog {repo_name}")
-    rc2 = run_trufflehog(repo_dir, secrets_file)
-    result["secrets"] = f"written:{secrets_file}" if rc2 == 0 else f"failed rc={rc2}"
-    if rc2 != 0:
-        result["errors"].append(f"trufflehog rc={rc2}")
-        log_error(f"TruffleHog {repo_name} rc={rc2}")
+    if secrets_file.exists():
+        result["secrets"] = f"exists:{secrets_file}"
+        log_skip(f"TruffleHog {repo_name} exists → skip")
     else:
-        log_ok(f"TruffleHog {repo_name} -> {secrets_file}")
+        log_info(f"TruffleHog {repo_name}")
+        rc2 = run_trufflehog(repo_dir, secrets_file)
+        result["secrets"] = f"written:{secrets_file}" if rc2 == 0 else f"failed rc={rc2}"
+        if rc2 != 0:
+            result["errors"].append(f"trufflehog rc={rc2}")
+            log_error(f"TruffleHog {repo_name} rc={rc2}")
+        else:
+            log_ok(f"TruffleHog {repo_name} -> {secrets_file}")
 
     return result
 
@@ -572,7 +719,7 @@ def main():
         f"Project: {AZDO_PROJECT}  Repos: {len(repos)}  Workers: {MAX_WORKERS}  SBOM: {sbom_tool}"
     )
     results = []
-    # Skip disabled repositories early
+    # Skip disabled repositories early and prepare actionable plan
     active_repos = []
     for r in repos:
         if r.get("disabled"):
@@ -587,17 +734,75 @@ def main():
         else:
             active_repos.append(r)
 
+    # Build plan: decide clone vs update vs skip (exists/missing) and show counts
+    to_run = []
+    planned_clone = planned_update = planned_skip = 0
+    for r in active_repos:
+        name = r["name"]
+        ssh_u = (r.get("sshUrl") or build_ssh_remote_url(name))
+        https_u = (r.get("remoteUrl") or build_https_remote_url(name))
+        repo_dir = WORKSPACE_DIR / name
+        if (repo_dir / ".git").exists():
+            if not UPDATE_EXISTING:
+                planned_skip += 1
+                results.append({
+                    "repo": name,
+                    "clone": "exists-skipped",
+                    "sbom": None,
+                    "secrets": None,
+                    "errors": ["exists-skipped"],
+                })
+                continue
+            planned_update += 1
+        else:
+            if os.environ.get("ONLY_UPDATE", "").lower() in ("1", "true", "yes", "on"):
+                planned_skip += 1
+                results.append({
+                    "repo": name,
+                    "clone": "missing-skipped",
+                    "sbom": None,
+                    "secrets": None,
+                    "errors": ["missing-skipped"],
+                })
+                continue
+            planned_clone += 1
+        to_run.append((name, ssh_u, https_u))
+
+    total_tasks = len(to_run)
+    log_info(
+        f"Plan: clone {planned_clone}, update {planned_update}, skip {planned_skip} → total {total_tasks}"
+    )
+
+    # Progress tracking
+    done = 0
+    failed = 0
+    prog_lock = threading.Lock()
+
+    def _on_done(fut):
+        nonlocal done, failed
+        try:
+            res = fut.result()
+        except Exception:
+            res = {"errors": ["exception"]}
+        with prog_lock:
+            done += 1
+            if res and res.get("errors"):
+                failed += 1
+            log_info(f"Progress: {done}/{total_tasks} done, failures {failed}")
+
     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futs = [
-            pool.submit(
+        futs = []
+        for name, ssh_u, https_u in to_run:
+            fut = pool.submit(
                 process_repo,
                 AZDO_PROJECT,
-                r["name"],
-                (r.get("sshUrl") or build_ssh_remote_url(r["name"])) ,
+                name,
+                ssh_u,
+                https_u,
                 sbom_tool,
             )
-            for r in active_repos
-        ]
+            fut.add_done_callback(_on_done)
+            futs.append(fut)
         for f in cf.as_completed(futs):
             results.append(f.result())
 
@@ -622,6 +827,7 @@ def main():
                         AZDO_PROJECT,
                         rr["repo"],
                         (src.get("sshUrl") or build_ssh_remote_url(rr["repo"])) ,
+                        (src.get("remoteUrl") or build_https_remote_url(rr["repo"])),
                         sbom_tool,
                     )
                 )

@@ -1,5 +1,45 @@
 ## Azure DevOps Clone & Scan
 
+### TL;DR
+
+```bash
+# 1) Install deps
+uv sync
+
+# 2) Clone/update + SBOM + TruffleHog (SSH-first, HTTPS fallback optional)
+uv run --env-file .env ./azdo_clone_and_scan.py
+
+# 3) Upload SBOMs to Dependency-Track
+uv run --env-file .env.dt ./dt_bulk_upload_sbom.py
+
+# 4) Create the Shai-Hulud policy and add PURL conditions from list_shai.txt
+uv run --env-file .env.dt ./dt_create_shai_policy.py
+
+# 5) Re-run analysis on all projects to apply the policy
+uv run --env-file .env.dt ./dt_trigger_reanalysis.py
+```
+
+### Table of Contents
+
+- [Azure DevOps Clone & Scan](#azure-devops-clone--scan)
+  - [TL;DR](#tldr)
+  - [Requirements](#requirements)
+  - [Installation](#installation)
+  - [Environment Variables](#environment-variables)
+  - [SSH Configuration](#ssh-configuration)
+  - [Usage](#usage)
+  - [What it does](#what-it-does)
+  - [Output](#output)
+  - [Tuning concurrency](#tuning-concurrency)
+  - [Troubleshooting](#troubleshooting)
+- [Dependency-Track](#dependency-track)
+  - [Bulk uploader (`dt_bulk_upload_sbom.py`)](#dependency-track-bulk-uploader-dt_bulk_upload_sbompy)
+  - [Shai-Hulud Policy (Blocklist)](#shai-hulud-policy-blocklist)
+    - [Create policy and add conditions (`dt_create_shai_policy.py`)](#create-policy-and-add-conditions-dt_create_shai_policypy)
+    - [Wildcard versions with .x](#wildcard-versions-with-x)
+    - [Add conditions to an existing policy (`dt_add_conditions_only.py`)](#add-conditions-to-an-existing-policy-dt_add_conditions_onlypy)
+    - [Force reanalysis to apply policy (`dt_trigger_reanalysis.py`)](#force-reanalysis-to-apply-policy-dt_trigger_reanalysispy)
+
 Script to list repositories from an Azure DevOps project, clone/update them over SSH, generate an SBOM, and scan for secrets. Includes throttling controls, pretty colored logs, retries with backoff, SSH key selection, repo status handling (disabled/renamed/no-permission), and a final retry pass for transient failures.
 
 Made by Omnivya.
@@ -30,6 +70,11 @@ Put these in a `.env` file or set them in your environment.
 - SECRETS_OUT_DIR: Directory for TruffleHog outputs (default: `~/azdo-scan/secrets`)
 - MAX_WORKERS: Thread count for per-repo processing
   - Accepts integer or keywords: `auto`, `cpu`, `max`, `default`
+
+Results reuse / skipping:
+- SKIP_IF_RESULTS_EXIST: `true|false` (default: `true`).
+  - If both SBOM and TruffleHog outputs already exist for a repo, the repo is skipped entirely.
+  - Each artifact is also skipped independently if its output file already exists.
 
 Throttling and noise control:
 - GIT_MAX_CONCURRENCY: Max concurrent networked git ops (default: `min(MAX_WORKERS, 4)`)
@@ -136,4 +181,64 @@ Run:
 uv run --env-file .env ./dt_bulk_upload_sbom.py
 ```
 
+
+### Shai-Hulud Policy (Blocklist)
+
+Create and enforce an Operational blocklist policy in Dependency-Track using the PURLs listed in `list_shai.txt`.
+
+#### Create policy and add conditions (`dt_create_shai_policy.py`)
+
+Features:
+- Uses Dependency-Track OpenAPI v4 endpoints.
+- Creates the policy via `PUT /api/v1/policy` (requires a generated UUID).
+- Adds conditions via `PUT /api/v1/policy/{uuid}/condition` with operator `MATCHES`.
+- Supports `.x` versions in `list_shai.txt` by converting them to regex (e.g. `1.2.x` → `1\.2\..*`).
+- Accepts NPM (`pkg:npm/...`) and GitHub (`pkg:github/...`) purls.
+
+Env (from `.env.dt`):
+- `DT_URL` (or `DT_BASE_URL`), `DT_API_KEY`
+- Optional: `POLICY_NAME` (default `Shai-Hulud Blocklist`), `LIST_FILE` (default `list_shai.txt`), `DRY_RUN`
+
+Run:
+```bash
+uv run --env-file .env.dt ./dt_create_shai_policy.py
+```
+
+Notes:
+- Operator is `MATCHES` to support wildcard versions.
+- The script auto-generates a UUID and sets `global: true`.
+
+#### Wildcard versions with .x
+
+Lines like:
+```
+"ansi-regex@6.2.x"
+```
+are translated to a regex-backed purl condition:
+```
+pkg:npm/ansi-regex@6\.2\..*
+```
+which matches any patch version in the `6.2.*` range.
+
+#### Add conditions to an existing policy (`dt_add_conditions_only.py`)
+
+If you created a policy manually in the UI (Administration → Policies), you can attach conditions to it:
+```bash
+uv run --env-file .env.dt POLICY_NAME="Shai-Hulud Blocklist" ./dt_add_conditions_only.py
+```
+
+#### Force reanalysis to apply policy (`dt_trigger_reanalysis.py`)
+
+After adding conditions, trigger project-wide reanalysis and refresh metrics so violations appear:
+```bash
+# All projects
+uv run --env-file .env.dt ./dt_trigger_reanalysis.py
+
+# Filter by name pattern
+uv run --env-file .env.dt ./dt_trigger_reanalysis.py "Loop_"
+```
+
+Under the hood:
+- Triggers `POST /api/v1/finding/project/{uuid}/analyze` for each project.
+- Calls `GET /api/v1/metrics/project/{uuid}/refresh` to refresh metrics.
 
