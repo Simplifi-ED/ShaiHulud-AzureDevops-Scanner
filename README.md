@@ -2,6 +2,8 @@
 
 ### TL;DR
 
+Made by Omnivya. This repo automates: cloning AzDo repos, generating filesystem SBOMs, scanning sources with TruffleHog, uploading to Dependency-Track, and enforcing a "Shai‑Hulud" blocklist policy to quickly surface risky components and the kinds of secrets that can leak from your codebase.
+
 ```bash
 # 1) Install deps
 uv sync
