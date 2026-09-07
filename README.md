@@ -1,246 +1,280 @@
-## Azure DevOps Clone & Scan
+# Azure DevOps Supply-Chain Scanner
 
-### TL;DR
+**Inventory Azure DevOps repositories, generate SBOMs, scan for exposed secrets and push software-supply-chain evidence into Dependency-Track.**
 
-Made by Omnivya. This repo automates: cloning AzDo repos, generating filesystem SBOMs, scanning sources with TruffleHog, uploading to Dependency-Track, and enforcing a "Shai‑Hulud" blocklist policy to quickly surface risky components and the kinds of secrets that can leak from your codebase.
+This repository contains a set of Python tools used to audit Azure DevOps codebases at project scale. It clones or updates repositories, produces CycloneDX SBOMs, runs TruffleHog secret scans, uploads SBOMs to Dependency-Track, and can create or apply blocklist policies for known-risk packages.
 
-```bash
-# 1) Install deps
-uv sync
+The original project name references the "Shai-Hulud" package-compromise campaign. The tooling is broader than that incident: its useful scope is repeatable software-supply-chain assessment across many Azure DevOps repositories.
 
-# 2) Clone/update + SBOM + TruffleHog (SSH-first, HTTPS fallback optional)
-uv run --env-file .env ./azdo_clone_and_scan.py
+## Why this exists
 
-# 3) Upload SBOMs to Dependency-Track
-uv run --env-file .env.dt ./dt_bulk_upload_sbom.py
+A supply-chain review becomes difficult very quickly when an Azure DevOps project contains tens or hundreds of repositories. The important questions are not only "does this repository contain a vulnerable dependency?" but also:
 
-# 4) Create the Shai-Hulud policy and add PURL conditions from list_shai.txt
-uv run --env-file .env.dt ./dt_create_shai_policy.py
+- which repositories actually exist and are accessible;
+- which dependencies are present across the estate;
+- which source trees expose credentials or secrets;
+- which scans failed or were incomplete;
+- which components violate an explicit policy;
+- how to refresh the evidence without manually processing every repository again.
 
-# 5) Re-run analysis on all projects to apply the policy
-uv run --env-file .env.dt ./dt_trigger_reanalysis.py
+This project automates that collection pipeline so the output can be reviewed as evidence rather than as a pile of ad-hoc commands.
+
+## Audit pipeline
+
+```text
+Azure DevOps project
+        |
+        v
+List repositories through REST
+        |
+        v
+Clone / update repositories
+        |
+        +----------------------+
+        |                      |
+        v                      v
+CycloneDX SBOM             TruffleHog
+(cdxgen / syft)           secret scan
+        |                      |
+        +----------+-----------+
+                   |
+                   v
+          Local audit outputs
+                   |
+                   v
+          Dependency-Track
+                   |
+                   v
+        Policy evaluation / reanalysis
 ```
 
-### Table of Contents
+## Capabilities
 
-- [Azure DevOps Clone & Scan](#azure-devops-clone--scan)
-  - [TL;DR](#tldr)
-  - [Requirements](#requirements)
-  - [Installation](#installation)
-  - [Environment Variables](#environment-variables)
-  - [SSH Configuration](#ssh-configuration)
-  - [Usage](#usage)
-  - [What it does](#what-it-does)
-  - [Output](#output)
-  - [Tuning concurrency](#tuning-concurrency)
-  - [Troubleshooting](#troubleshooting)
-- [Dependency-Track](#dependency-track)
-  - [Bulk uploader (`dt_bulk_upload_sbom.py`)](#dependency-track-bulk-uploader-dt_bulk_upload_sbompy)
-  - [Shai-Hulud Policy (Blocklist)](#shai-hulud-policy-blocklist)
-    - [Create policy and add conditions (`dt_create_shai_policy.py`)](#create-policy-and-add-conditions-dt_create_shai_policypy)
-    - [Wildcard versions with .x](#wildcard-versions-with-x)
-    - [Add conditions to an existing policy (`dt_add_conditions_only.py`)](#add-conditions-to-an-existing-policy-dt_add_conditions_onlypy)
-    - [Force reanalysis to apply policy (`dt_trigger_reanalysis.py`)](#force-reanalysis-to-apply-policy-dt_trigger_reanalysispy)
+### Repository inventory and acquisition
 
-Script to list repositories from an Azure DevOps project, clone/update them over SSH, generate an SBOM, and scan for secrets. Includes throttling controls, pretty colored logs, retries with backoff, SSH key selection, repo status handling (disabled/renamed/no-permission), and a final retry pass for transient failures.
+`azdo_clone_and_scan.py`:
 
-Made by Omnivya.
+- lists repositories from an Azure DevOps project through the REST API;
+- prefers Azure DevOps SSH clone URLs;
+- clones missing repositories and updates existing clones;
+- skips disabled repositories;
+- classifies common failures such as missing repositories, permissions and timeouts;
+- retries transient failures with bounded backoff;
+- supports concurrency controls to avoid overwhelming Azure DevOps or the local machine.
 
-### Requirements
+### SBOM generation
+
+For each repository, the scanner generates a CycloneDX SBOM using:
+
+1. `cdxgen`, when available;
+2. `syft`, as a fallback.
+
+Outputs are written as one SBOM per repository.
+
+### Secret scanning
+
+The same workflow runs TruffleHog against repository content and stores JSONL findings per repository.
+
+> Partial Git clones can reduce scan completeness because the required blobs may not be available. Full-history/content acquisition is therefore the safer default when the goal is audit evidence.
+
+### Dependency-Track integration
+
+The repository includes scripts to:
+
+- bulk-upload generated SBOMs;
+- optionally create missing Dependency-Track projects;
+- wait for BOM processing;
+- create a global package blocklist policy;
+- add PURL-based conditions to an existing policy;
+- trigger project reanalysis and metrics refresh.
+
+## Requirements
+
 - Python 3.13+
-- `uv` package manager (recommended)
-- Tools (optional but recommended):
-  - `cdxgen` (preferred) or `syft` for SBOM generation
-  - `trufflehog` for secret scanning
-- SSH key configured on Azure DevOps (`git@ssh.dev.azure.com`)
+- [`uv`](https://docs.astral.sh/uv/) recommended for dependency management
+- Azure DevOps access
+- SSH key configured for Azure DevOps repository access
+- Azure DevOps PAT for REST repository discovery
 
-### Installation
+Optional but recommended scanning tools:
+
+- `cdxgen`
+- `syft`
+- `trufflehog`
+
+Dependency-Track is only required for the upload and policy stages.
+
+## Installation
+
 ```bash
 uv sync
 ```
 
-### Environment Variables
-Put these in a `.env` file or set them in your environment.
+## Quick start
 
-- AZDO_ORG_URL: Azure DevOps org URL. Examples:
-  - `https://dev.azure.com/<org>`
-  - `https://<org>.visualstudio.com`
-- AZDO_PROJECT: Azure DevOps project name
-- AZDO_PAT: Azure DevOps Personal Access Token (used only for REST listing)
-- WORKSPACE_DIR: Directory where repos are cloned (default: `~/azdo-workspace`)
-- SBOM_OUT_DIR: Directory for SBOM outputs (default: `~/azdo-scan/sbom`)
-- SECRETS_OUT_DIR: Directory for TruffleHog outputs (default: `~/azdo-scan/secrets`)
-- MAX_WORKERS: Thread count for per-repo processing
-  - Accepts integer or keywords: `auto`, `cpu`, `max`, `default`
+### 1. Configure Azure DevOps access
 
-Results reuse / skipping:
-- SKIP_IF_RESULTS_EXIST: `true|false` (default: `true`).
-  - If both SBOM and TruffleHog outputs already exist for a repo, the repo is skipped entirely.
-  - Each artifact is also skipped independently if its output file already exists.
+Create a `.env` file or export equivalent variables:
 
-Throttling and noise control:
-- GIT_MAX_CONCURRENCY: Max concurrent networked git ops (default: `min(MAX_WORKERS, 4)`)
-- GIT_CLONE_CONCURRENCY: Max concurrent clones (default: `1`)
-- GIT_MAX_RETRIES: Retries for git clone/fetch (default: `3`)
-- HTTP_MAX_RETRIES: Retries for REST listing (default: `4`)
-- BACKOFF_BASE_MS: Backoff base in ms (default: `300`)
-- BACKOFF_MAX_MS: Backoff max in ms (default: `5000`)
-- START_STAGGER_MS: Random startup jitter per repo in ms (default: `0`)
-- GIT_QUIET: Suppress git stdout (`true`/`false`, default: `true`)
-- GIT_PARTIAL_CLONE: Use `--filter=blob:none` on clone (default: `false`)
-- NO_COLOR: Disable ANSI colors in logs (any value → disables)
+```text
+AZDO_ORG_URL=https://dev.azure.com/<org>
+AZDO_PROJECT=<project>
+AZDO_PAT=<pat>
+```
 
-SSH:
-- GIT_SSH_KEY or AZDO_SSH_KEY: Path to private key to use (forces `IdentitiesOnly=yes`)
-- GIT_SSH_OPTS: Extra ssh options (default includes `ConnectTimeout=20`, keepalives, `PreferredAuthentications=publickey`, `IPQoS=throughput`)
+Useful optional paths and concurrency settings include:
 
-### SSH Configuration
-Ensure your SSH key is set up for Azure DevOps:
+```text
+WORKSPACE_DIR=~/azdo-workspace
+SBOM_OUT_DIR=~/azdo-scan/sbom
+SECRETS_OUT_DIR=~/azdo-scan/secrets
+MAX_WORKERS=auto
+GIT_MAX_CONCURRENCY=4
+GIT_CLONE_CONCURRENCY=1
+```
+
+Configure SSH access and verify it independently:
+
 ```bash
 ssh -T git@ssh.dev.azure.com
 ```
-Repository URLs are constructed as: `git@ssh.dev.azure.com:v3/{org}/{project}/{repo}`.
 
-Note: The script prefers `sshUrl` returned by the Azure DevOps REST API when present, and falls back to the constructed URL only if missing. Existing clones have their `origin` URL updated automatically.
+### 2. Clone/update and scan repositories
 
-### Usage
-With `.env`:
 ```bash
 uv run --env-file .env ./azdo_clone_and_scan.py
 ```
 
-Override or add flags inline:
-```bash
-uv run --env-file .env GIT_MAX_CONCURRENCY=3 START_STAGGER_MS=500 ./azdo_clone_and_scan.py
+The workflow produces:
+
+```text
+${SBOM_OUT_DIR}/{project}_{repo}.cdx.json
+${SECRETS_OUT_DIR}/{project}_{repo}.trufflehog.jsonl
 ```
 
-Note on TruffleHog: partial clones can yield empty results because blobs are not fetched. The default here disables partial clone. If you need lower bandwidth, enable `GIT_PARTIAL_CLONE=true` but be aware scans may be incomplete unless you fetch full history/blobs.
+A final JSON summary is printed to stdout.
 
-Extra options for TruffleHog:
-- TRUFFLEHOG_ONLY_VERIFIED: `true|false` (default follows your env)
-- TRUFFLEHOG_ARGS: additional flags appended to the command, e.g. `--branch main` or `--since-commit <sha>`
+### 3. Upload SBOMs to Dependency-Track
 
-Without code changes you can also point to a custom env file:
-```bash
-uv run --env-file .env ./azdo_clone_and_scan.py
+Configure `.env.dt`:
+
+```text
+DT_URL=<dependency-track-url>
+DT_API_KEY=<api-key>
 ```
 
-### What it does
-For each repository in the Azure DevOps project:
-1. Skips disabled repositories (from REST API `isDisabled`/`status`)
-2. Clone over SSH if missing (using API `sshUrl` if available), or fetch/prune and hard reset to `origin/HEAD` if present
-2. Generate an SBOM (prefers `cdxgen`, falls back to `syft`)
-3. Run `trufflehog` secret scan
-4. Classifies failures: `disabled`, `not-found-or-renamed`, `no-permission`, `timeout`, `unknown`
-5. Performs a final limited retry pass for transient classes (`timeout`, `unknown`)
-6. Appends results to a final JSON summary printed on stdout
+Then run:
 
-Status lines are printed per repo with colors/emojis:
-- Starting: `ℹ️ Cloning <repo>` or `ℹ️ Updating <repo>`
-- SBOM/Secrets: `ℹ️ SBOM <repo> with <tool>` and `ℹ️ TruffleHog <repo>`
-- Completion: `✅ <repo> cloned/updated`, `✅ SBOM ...`, `✅ TruffleHog ...` or `❌ ...`
-- Skips: `⏭️ <repo> disabled|not-found-or-renamed|no-permission`
-
-### Output
-- SBOM: `${SBOM_OUT_DIR}/{project}_{repo}.cdx.json`
-- Secrets: `${SECRETS_OUT_DIR}/{project}_{repo}.trufflehog.jsonl`
-- Final summary: JSON to stdout
-
-### Tuning concurrency
-- `MAX_WORKERS` controls total threads
-- `GIT_MAX_CONCURRENCY` caps simultaneous git fetch network ops
-- `GIT_CLONE_CONCURRENCY` caps simultaneous clones
-- `START_STAGGER_MS` reduces start bursts
-- Retries/backoff (with jitter) applied to git and REST calls
-
-### Troubleshooting
-- `ModuleNotFoundError: requests` → run `uv sync`
-- SSH permission denied → add your key to Azure DevOps and ensure ssh-agent is loaded (`ssh-add -l`)
-- Rate limiting (429) → lower `GIT_MAX_CONCURRENCY`, increase `START_STAGGER_MS`, or keep defaults to let backoff handle it
-- Timeouts to `ssh.dev.azure.com:22` → reduce clone concurrency, raise `ConnectTimeout` in `GIT_SSH_OPTS`, or re-run at a quieter time; the script will auto-retry and re-process transient failures at the end
-
-### Two-phase mode (optional)
-Currently, each repo is scanned right after its clone/update. If you want a two-phase mode (clone all, then scan), open an issue or adjust the flow; the code is structured to make this change straightforward.
-
-## Dependency-Track bulk uploader (`dt_bulk_upload_sbom.py`)
-
-Uploads CycloneDX SBOMs to Dependency-Track.
-
-Highlights:
-- Validates project existence via `/api/v1/project/lookup` and creates it when `DT_AUTOCREATE=true`
-- Optionally waits for processing via token polling
-
-Env:
-- `DT_URL`, `DT_API_KEY` (required)
-- `SBOM_DIR` (default `~/azdo-scan/sbom`)
-- `DT_DEFAULT_VERSION` (default `HEAD`)
-- `DT_AUTOCREATE` (default `true`)
-- `WAIT_FOR_PROCESSING` (default `false`)
-- `MAX_WORKERS` (same parsing as above)
-
-Run:
 ```bash
-uv run --env-file .env ./dt_bulk_upload_sbom.py
+uv run --env-file .env.dt ./dt_bulk_upload_sbom.py
 ```
 
+Optional settings include:
 
-### Shai-Hulud Policy (Blocklist)
+```text
+SBOM_DIR=~/azdo-scan/sbom
+DT_DEFAULT_VERSION=HEAD
+DT_AUTOCREATE=true
+WAIT_FOR_PROCESSING=false
+MAX_WORKERS=auto
+```
 
-Create and enforce an Operational blocklist policy in Dependency-Track using the PURLs listed in `list_shai.txt`.
+### 4. Apply a package blocklist policy
 
-#### Create policy and add conditions (`dt_create_shai_policy.py`)
+The repository includes a sample policy workflow based on PURLs from `list_shai.txt`:
 
-Features:
-- Uses Dependency-Track OpenAPI v4 endpoints.
-- Creates the policy via `PUT /api/v1/policy` (requires a generated UUID).
-- Adds conditions via `PUT /api/v1/policy/{uuid}/condition` with operator `MATCHES`.
-- Supports `.x` versions in `list_shai.txt` by converting them to regex (e.g. `1.2.x` → `1\.2\..*`).
-- Accepts NPM (`pkg:npm/...`) and GitHub (`pkg:github/...`) purls.
-
-Env (from `.env.dt`):
-- `DT_URL` (or `DT_BASE_URL`), `DT_API_KEY`
-- Optional: `POLICY_NAME` (default `Shai-Hulud Blocklist`), `LIST_FILE` (default `list_shai.txt`), `DRY_RUN`
-
-Run:
 ```bash
 uv run --env-file .env.dt ./dt_create_shai_policy.py
 ```
 
-Notes:
-- Operator is `MATCHES` to support wildcard versions.
-- The script auto-generates a UUID and sets `global: true`.
+The script creates a global Dependency-Track policy and attaches `MATCHES` conditions. Entries ending in `.x` are converted into regex-backed version matches.
 
-#### Wildcard versions with .x
+To add conditions to an existing policy instead:
 
-Lines like:
-```
-"ansi-regex@6.2.x"
-```
-are translated to a regex-backed purl condition:
-```
-pkg:npm/ansi-regex@6\.2\..*
-```
-which matches any patch version in the `6.2.*` range.
-
-#### Add conditions to an existing policy (`dt_add_conditions_only.py`)
-
-If you created a policy manually in the UI (Administration → Policies), you can attach conditions to it:
 ```bash
 uv run --env-file .env.dt POLICY_NAME="Shai-Hulud Blocklist" ./dt_add_conditions_only.py
 ```
 
-#### Force reanalysis to apply policy (`dt_trigger_reanalysis.py`)
+### 5. Trigger reanalysis
 
-After adding conditions, trigger project-wide reanalysis and refresh metrics so violations appear:
 ```bash
-# All projects
 uv run --env-file .env.dt ./dt_trigger_reanalysis.py
-
-# Filter by name pattern
-uv run --env-file .env.dt ./dt_trigger_reanalysis.py "Loop_"
 ```
 
-Under the hood:
-- Triggers `POST /api/v1/finding/project/{uuid}/analyze` for each project.
-- Calls `GET /api/v1/metrics/project/{uuid}/refresh` to refresh metrics.
+You can also filter projects by name:
 
+```bash
+uv run --env-file .env.dt ./dt_trigger_reanalysis.py "<pattern>"
+```
+
+## Concurrency and retry controls
+
+Large Azure DevOps projects can stress both Git endpoints and the local workstation. The scanner exposes controls including:
+
+- `MAX_WORKERS`
+- `GIT_MAX_CONCURRENCY`
+- `GIT_CLONE_CONCURRENCY`
+- `GIT_MAX_RETRIES`
+- `HTTP_MAX_RETRIES`
+- `BACKOFF_BASE_MS`
+- `BACKOFF_MAX_MS`
+- `START_STAGGER_MS`
+- `GIT_PARTIAL_CLONE`
+
+Defaults favour bounded network concurrency rather than starting every clone simultaneously.
+
+## Result reuse
+
+Set:
+
+```text
+SKIP_IF_RESULTS_EXIST=true
+```
+
+when existing SBOM and secret-scan artifacts should be reused. Individual artifacts can also be skipped when their expected result already exists.
+
+This is useful for iterative audits, but stale artifacts are still stale evidence. Remove or regenerate outputs when repository state has materially changed.
+
+## Security considerations
+
+This tool handles credentials and may process sensitive source code. Treat the audit workstation and generated artifacts accordingly.
+
+- Use a PAT with only the permissions required for repository discovery.
+- Use a dedicated SSH key where practical.
+- Keep `.env`, `.env.dt`, PATs, SSH private keys and Dependency-Track API keys out of Git.
+- Secret-scan outputs can themselves contain sensitive material; protect them as audit evidence.
+- SBOMs reveal internal package and architecture information and should not automatically be considered public.
+- Review TruffleHog findings before assuming that every detector result is exploitable.
+- A clean scan is not proof that a repository is secure; it only reflects the scanners, rules and repository content available during the run.
+
+## Scope and limitations
+
+This repository is an audit toolkit, not a complete CI/CD security platform.
+
+It does not by itself:
+
+- prove that every dependency is safe;
+- guarantee complete secret detection;
+- replace repository permissions, branch protection or build provenance controls;
+- automatically remediate policy violations;
+- validate runtime workloads or deployed artifacts.
+
+Its purpose is to collect repeatable evidence that can feed a broader technical or software-supply-chain assessment.
+
+## Troubleshooting
+
+Common cases:
+
+- `ModuleNotFoundError: requests` — run `uv sync`.
+- SSH permission denied — verify the Azure DevOps SSH key and `ssh-agent` state.
+- HTTP 429 / rate limiting — reduce concurrency or increase startup staggering.
+- SSH timeouts — reduce clone concurrency and retry; the scanner already applies bounded retries to transient failures.
+- Empty TruffleHog results with partial clones — fetch the required Git content or disable partial clone.
+
+## Maintained by Omnivya
+
+This project is part of [Omnivya](https://www.omnivya.fr/) public engineering work around platform security, SBOMs, CI/CD security and technical audits.
+
+## License
+
+See the repository [`LICENSE`](./LICENSE) file.
