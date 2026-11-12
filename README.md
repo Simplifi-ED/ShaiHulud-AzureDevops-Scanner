@@ -1,10 +1,26 @@
-# Azure DevOps Supply-Chain Scanner
+# Azure DevOps Supply Chain Scanner
 
-**Inventory Azure DevOps repositories, generate SBOMs, scan for exposed secrets and push software-supply-chain evidence into Dependency-Track.**
+**Audit Azure DevOps repositories at scale: inventory codebases, generate CycloneDX SBOMs, scan for exposed secrets with TruffleHog, and push evidence into Dependency-Track for policy evaluation.**
 
-This repository contains a set of Python tools used to audit Azure DevOps codebases at project scale. It clones or updates repositories, produces CycloneDX SBOMs, runs TruffleHog secret scans, uploads SBOMs to Dependency-Track, and can create or apply blocklist policies for known-risk packages.
+**FR :** toolkit d'audit de supply chain logicielle pour Azure DevOps : inventaire des dépôts, SBOM CycloneDX, détection de secrets, Dependency-Track et politiques de composants à risque.
 
-The original project name references the "Shai-Hulud" package-compromise campaign. The tooling is broader than that incident: its useful scope is repeatable software-supply-chain assessment across many Azure DevOps repositories.
+<p align="center">
+  <a href="https://www.omnivya.fr/expertises/software-supply-chain-security/?utm_source=github&utm_medium=repository&utm_campaign=azure-devops-supply-chain-scanner&utm_content=readme">Software supply-chain security</a> ·
+  <a href="https://www.omnivya.fr/fr/expertises/software-supply-chain-security/?utm_source=github&utm_medium=repository&utm_campaign=azure-devops-supply-chain-scanner&utm_content=readme-fr">FR</a> ·
+  <a href="https://www.omnivya.fr/work/?utm_source=github&utm_medium=repository&utm_campaign=azure-devops-supply-chain-scanner&utm_content=public-work">Omnivya public work</a>
+</p>
+
+This toolkit is designed for repeatable assessment across **tens or hundreds of Azure DevOps repositories**, where repository inventory, dependency evidence, secret findings and policy results need to be collected consistently rather than assembled from ad-hoc commands.
+
+> The current repository name references the original “Shai-Hulud” package-compromise investigation. The project scope is broader; the intended long-term name is **azure-devops-supply-chain-scanner**.
+
+## What it collects
+
+- Azure DevOps repository inventory and repeatable clone/update state.
+- CycloneDX SBOMs via `cdxgen` with `syft` fallback.
+- TruffleHog secret-scan evidence.
+- Dependency-Track uploads, project creation, policy checks and reanalysis.
+- Explicit failure/retry state so incomplete evidence is visible.
 
 ## Why this exists
 
